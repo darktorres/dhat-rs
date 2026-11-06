@@ -370,21 +370,34 @@
 
 use backtrace::SymbolName;
 use lazy_static::lazy_static;
-// In normal Rust code, the allocator is on a lower level than the mutex
-// implementation, which means the mutex implementation can use the allocator.
-// But DHAT implements an allocator which requires a mutex. If we're not
-// careful, this can easily result in deadlocks from circular sequences of
-// operations, E.g. see #18 and #25 from when we used `parking_lot::Mutex`. We
-// now use `mintex::Mutex`, which is guaranteed to not allocate, effectively
-// making the mutex implementation on a lower level than the allocator,
-// allowing the allocator to depend on it.
-use mintex::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+// DHAT implements an allocator that needs a mutex, so the mutex must never
+// allocate, or the two deadlock (upstream issues #18 and #25, with
+// `parking_lot::Mutex`). `std::sync::Mutex` is a futex on Linux and does not
+// allocate; a waiting thread sleeps instead of spinning. A poisoned lock is
+// taken as is.
+struct Mutex<T>(std::sync::Mutex<T>);
+
+impl<T> Mutex<T> {
+    fn new(t: T) -> Self {
+        Self(std::sync::Mutex::new(t))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, T> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+// Set while a heap profiler with whole backtraces runs: allocations then take
+// their backtrace before the lock, as an untrimmed walk needs no shared state.
+static UNTRIMMED_HEAP: AtomicBool = AtomicBool::new(false);
 use rustc_hash::FxHashMap;
 use serde::Serialize;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::fs::File;
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::io::BufWriter;
 use std::ops::AddAssign;
 use std::path::{Path, PathBuf};
@@ -494,6 +507,10 @@ struct HeapGlobals {
     // implement `Send`.
     live_blocks: FxHashMap<usize, LiveBlock>,
 
+    // How many times a global peak has been recorded. A `PpInfo` copies its
+    // counts into `at_tgmax_*` lazily, before its first change after a peak.
+    peak_seq: u64,
+
     // Current counts.
     curr_blocks: usize,
     curr_bytes: usize,
@@ -583,7 +600,8 @@ impl Globals {
             h.tgmax_instant = now;
         }
 
-        self.pp_infos[pp_info_idx].update_counts_for_alloc(size, delta);
+        let seq = h.peak_seq;
+        self.pp_infos[pp_info_idx].update_counts_for_alloc(size, delta, seq);
     }
 
     fn update_counts_for_dealloc(
@@ -595,8 +613,9 @@ impl Globals {
         let h = self.heap.as_mut().unwrap();
         h.curr_blocks -= 1;
         h.curr_bytes -= size;
+        let seq = h.peak_seq;
 
-        self.pp_infos[pp_info_idx].update_counts_for_dealloc(size, alloc_duration);
+        self.pp_infos[pp_info_idx].update_counts_for_dealloc(size, alloc_duration, seq);
     }
 
     fn update_counts_for_ad_hoc_event(&mut self, pp_info_idx: usize, weight: usize) {
@@ -616,12 +635,16 @@ impl Globals {
         let h = self.heap.as_mut().unwrap();
         if h.curr_bytes == h.max_bytes {
             // It's a peak. (If there are multiple equal peaks we record the
-            // latest one.) Record it in every PpInfo.
-            for pp_info in self.pp_infos.iter_mut() {
-                let h = pp_info.heap.as_mut().unwrap();
-                h.at_tgmax_blocks = h.curr_blocks;
-                h.at_tgmax_bytes = h.curr_bytes;
-            }
+            // latest one.) Each PpInfo records it before its next change.
+            h.peak_seq += 1;
+        }
+    }
+
+    // Brings every PpInfo's `at_tgmax_*` up to the latest peak.
+    fn sync_global_peak(&mut self) {
+        let seq = self.heap.as_ref().unwrap().peak_seq;
+        for pp_info in self.pp_infos.iter_mut() {
+            pp_info.heap.as_mut().unwrap().sync_peak(seq);
         }
     }
 
@@ -657,6 +680,7 @@ impl Globals {
         if self.heap.is_some() {
             // Total bytes is at a possible peak.
             self.check_for_global_peak();
+            self.sync_global_peak();
 
             let h = self.heap.as_ref().unwrap();
 
@@ -684,43 +708,32 @@ impl Globals {
         // and replace it with an empty `FxHashMap`. (This is necessary because
         // we modify the *keys* here with `resolve`, which isn't allowed with a
         // non-consuming iterator.)
+        let mut resolved: FxHashMap<usize, Vec<(String, String)>> = FxHashMap::default();
         let pps: Vec<_> = std::mem::take(&mut self.backtraces)
             .into_iter()
-            .map(|(mut bt, pp_info_idx)| {
-                // Do the potentially expensive debug info lookups to get
-                // symbol names, line numbers, etc.
-                bt.0.resolve();
-
-                // Trim boring frames at the top and bottom of the backtrace.
-                let first_symbol_to_show = if self.trim_backtraces.is_some() {
-                    if self.heap.is_some() {
-                        bt.first_heap_symbol_to_show()
-                    } else {
-                        bt.first_ad_hoc_symbol_to_show()
-                    }
+            .map(|(bt, pp_info_idx)| {
+                for &ip in bt.0.iter() {
+                    resolve_ip(ip, &mut resolved);
+                }
+                let symbols: Vec<&(String, String)> =
+                    bt.0.iter().flat_map(|ip| resolved[ip].iter()).collect();
+                let first_symbol_to_show = if self.trim_backtraces.is_some() && self.heap.is_some()
+                {
+                    Backtrace::first_heap_symbol_to_show(&symbols)
                 } else {
                     0
                 };
-
-                // Determine the frame indices for this backtrace. This
-                // involves getting the string for each frame and adding a
-                // new entry to `ftbl_indices` if it hasn't been seen
-                // before.
                 let mut fs = vec![];
-                let mut i = 0;
-                for frame in bt.0.frames().iter() {
-                    for symbol in frame.symbols().iter() {
-                        i += 1;
-                        if (i - 1) < first_symbol_to_show {
-                            continue;
-                        }
-                        let s = Backtrace::frame_to_string(frame, symbol);
-                        let &mut ftbl_idx = ftbl_indices.entry(s).or_insert_with(|| {
+                for (_, s) in symbols.iter().skip(first_symbol_to_show) {
+                    let ftbl_idx = match ftbl_indices.get(s) {
+                        Some(&i) => i,
+                        None => {
+                            ftbl_indices.insert(s.clone(), next_ftbl_idx);
                             next_ftbl_idx += 1;
                             next_ftbl_idx - 1
-                        });
-                        fs.push(ftbl_idx);
-                    }
+                        }
+                    };
+                    fs.push(ftbl_idx);
                 }
 
                 PpInfoJson::new(&self.pp_infos[pp_info_idx], fs)
@@ -824,6 +837,7 @@ impl HeapGlobals {
     fn new() -> Self {
         Self {
             live_blocks: FxHashMap::default(),
+            peak_seq: 0,
             curr_blocks: 0,
             curr_bytes: 0,
             max_blocks: 0,
@@ -857,6 +871,9 @@ struct HeapPpInfo {
     at_tgmax_blocks: usize,
     at_tgmax_bytes: usize,
 
+    // The `HeapGlobals::peak_seq` that `at_tgmax_*` is current with.
+    peak_seq: u64,
+
     // Total lifetimes of all blocks allocated by this PP. Includes blocks
     // explicitly freed and blocks implicitly freed at termination.
     total_lifetimes_duration: Duration,
@@ -879,11 +896,12 @@ impl PpInfo {
         }
     }
 
-    fn update_counts_for_alloc(&mut self, size: usize, delta: Option<Delta>) {
+    fn update_counts_for_alloc(&mut self, size: usize, delta: Option<Delta>, seq: u64) {
         self.total_blocks += 1;
         self.total_bytes += size as u64;
 
         let h = self.heap.as_mut().unwrap();
+        h.sync_peak(seq);
         if let Some(delta) = delta {
             // realloc
             h.curr_blocks += 0; // unchanged
@@ -902,8 +920,9 @@ impl PpInfo {
         }
     }
 
-    fn update_counts_for_dealloc(&mut self, size: usize, alloc_duration: Duration) {
+    fn update_counts_for_dealloc(&mut self, size: usize, alloc_duration: Duration, seq: u64) {
         let h = self.heap.as_mut().unwrap();
+        h.sync_peak(seq);
         h.curr_blocks -= 1;
         h.curr_bytes -= size;
         h.total_lifetimes_duration += alloc_duration;
@@ -913,6 +932,18 @@ impl PpInfo {
         std::assert!(self.heap.is_none());
         self.total_blocks += 1;
         self.total_bytes += weight as u64;
+    }
+}
+
+impl HeapPpInfo {
+    // Before the first change after a global peak, the counts are the ones
+    // the peak saw.
+    fn sync_peak(&mut self, seq: u64) {
+        if self.peak_seq != seq {
+            self.at_tgmax_blocks = self.curr_blocks;
+            self.at_tgmax_bytes = self.curr_bytes;
+            self.peak_seq = seq;
+        }
     }
 }
 
@@ -1143,6 +1174,10 @@ impl ProfilerBuilder {
                 } else {
                     None
                 };
+                UNTRIMMED_HEAP.store(
+                    !self.ad_hoc && self.trim_backtraces.is_none(),
+                    Ordering::Relaxed,
+                );
                 *phase = Phase::Running(Globals::new(
                     self.testing,
                     file_name,
@@ -1188,33 +1223,178 @@ macro_rules! new_backtrace {
 // function (with `inline(never)` just to be safe) rather than a macro like
 // `new_backtrace`. The frame for this function will be removed by top frame
 // trimming.
+// Walks the frame-pointer chain: each frame record is the caller's frame
+// pointer followed by the return address into the caller, on x86_64 and on
+// aarch64 alike. Built only for the targets `build.rs` names, when the
+// program is compiled with `-C force-frame-pointers=yes`; the standard library
+// keeps frame pointers already. A frame pointer outside this thread's stack,
+// or not above the previous one, ends the walk.
+#[cfg(dhat_frame_pointers)]
 #[inline(never)]
 fn new_backtrace_inner(
     trim_backtraces: Option<usize>,
     frames_to_trim: &FxHashMap<usize, TB>,
 ) -> Backtrace {
-    // Get the backtrace, trimming if necessary at the top and bottom and for
-    // length.
-    let mut frames = Vec::new();
+    let (lo, hi) = stack_bounds();
+    let mut fp = frame_pointer();
+    let mut frames = Vec::with_capacity(64);
+    while fp >= lo && fp % 8 == 0 && fp + 16 <= hi && frames.len() < 4096 {
+        let (next, ip) = unsafe { (*(fp as *const usize), *((fp + 8) as *const usize)) };
+        if ip == 0 {
+            break;
+        }
+        let keep = match trim_backtraces.and(frames_to_trim.get(&ip)) {
+            Some(TB::Top) => false,
+            Some(TB::Bottom) => break,
+            None => true,
+        };
+        if keep {
+            frames.push(ip);
+            if trim_backtraces.is_some_and(|max_frames| frames.len() >= max_frames) {
+                break;
+            }
+        }
+        if next <= fp {
+            break;
+        }
+        fp = next;
+    }
+    Backtrace(frames.into_boxed_slice())
+}
+
+// Unwinds with the platform's unwinder, keeping each frame's return address.
+#[cfg(not(dhat_frame_pointers))]
+#[inline(never)]
+fn new_backtrace_inner(
+    trim_backtraces: Option<usize>,
+    frames_to_trim: &FxHashMap<usize, TB>,
+) -> Backtrace {
+    let mut frames = Vec::with_capacity(64);
     backtrace::trace(|frame| {
         let ip = frame.ip() as usize;
         if trim_backtraces.is_some() {
             match frames_to_trim.get(&ip) {
-                Some(TB::Top) => return true,     // ignore frame and continue
-                Some(TB::Bottom) => return false, // ignore frame and stop
-                _ => {}                           // use this frame
+                Some(TB::Top) => return true,
+                Some(TB::Bottom) => return false,
+                _ => {}
             }
         }
-
-        frames.push(frame.clone().into());
-
-        if let Some(max_frames) = trim_backtraces {
-            frames.len() < max_frames // stop if we have enough frames
-        } else {
-            true // continue
+        frames.push(ip);
+        match trim_backtraces {
+            Some(max_frames) => frames.len() < max_frames,
+            None => true,
         }
     });
-    Backtrace(frames.into())
+    Backtrace(frames.into_boxed_slice())
+}
+
+// The frame pointer of the function that calls this one: `rbp` on x86_64 and
+// `x29` on aarch64. Always inlined, so that it is the caller's frame.
+#[cfg(all(dhat_frame_pointers, target_arch = "x86_64"))]
+#[inline(always)]
+fn frame_pointer() -> usize {
+    let fp: usize;
+    unsafe {
+        std::arch::asm!("mov {}, rbp", out(reg) fp, options(nomem, nostack, preserves_flags));
+    }
+    fp
+}
+
+#[cfg(all(dhat_frame_pointers, target_arch = "aarch64"))]
+#[inline(always)]
+fn frame_pointer() -> usize {
+    let fp: usize;
+    unsafe {
+        std::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack, preserves_flags));
+    }
+    fp
+}
+
+#[cfg(all(
+    dhat_frame_pointers,
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+compile_error!(
+    "`build.rs` names a target whose frame pointer register `frame_pointer` does not read"
+);
+
+#[cfg(dhat_frame_pointers)]
+thread_local! {
+    static STACK_BOUNDS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+}
+
+// This thread's stack, `[lo, hi)`, read once per thread. When the system does
+// not give it, the bounds are all addresses, and the chain's own shape ends
+// the walk.
+#[cfg(dhat_frame_pointers)]
+fn stack_bounds() -> (usize, usize) {
+    STACK_BOUNDS.with(|b| {
+        let cur = b.get();
+        if cur.1 != 0 {
+            return cur;
+        }
+        let bounds = thread_stack().unwrap_or((0, usize::MAX));
+        b.set(bounds);
+        bounds
+    })
+}
+
+// glibc and musl give a thread's stack through its attributes.
+#[cfg(all(dhat_frame_pointers, target_os = "linux"))]
+fn thread_stack() -> Option<(usize, usize)> {
+    unsafe {
+        let mut attr: libc::pthread_attr_t = std::mem::zeroed();
+        if libc::pthread_getattr_np(libc::pthread_self(), &mut attr) != 0 {
+            return None;
+        }
+        let mut addr: *mut libc::c_void = std::ptr::null_mut();
+        let mut size: libc::size_t = 0;
+        let found = libc::pthread_attr_getstack(&attr, &mut addr, &mut size) == 0;
+        libc::pthread_attr_destroy(&mut attr);
+        found.then(|| (addr as usize, addr as usize + size))
+    }
+}
+
+// macOS gives a thread's stack as its highest address and its size.
+#[cfg(all(dhat_frame_pointers, target_os = "macos"))]
+fn thread_stack() -> Option<(usize, usize)> {
+    unsafe {
+        let thread = libc::pthread_self();
+        let hi = libc::pthread_get_stackaddr_np(thread) as usize;
+        let size = libc::pthread_get_stacksize_np(thread);
+        hi.checked_sub(size).map(|lo| (lo, hi))
+    }
+}
+
+// The symbols of one return address, innermost (inlined) first: each one's
+// demangled name and its frame-table string. Resolved once per address.
+fn resolve_ip(
+    ip: usize,
+    cache: &mut FxHashMap<usize, Vec<(String, String)>>,
+) -> &[(String, String)] {
+    cache.entry(ip).or_insert_with(|| {
+        let mut out = vec![];
+        backtrace::resolve(ip as *mut std::ffi::c_void, |symbol| {
+            let name = format!(
+                "{:#}",
+                symbol.name().unwrap_or_else(|| SymbolName::new(b"???"))
+            );
+            let s = format!(
+                "{:?}: {} ({:#}:{}:{})",
+                ip as *mut std::ffi::c_void,
+                name,
+                match symbol.filename() {
+                    Some(path) => trim_path(path),
+                    None => Path::new("???"),
+                }
+                .display(),
+                symbol.lineno().unwrap_or(0),
+                symbol.colno().unwrap_or(0),
+            );
+            out.push((name, s));
+        });
+        out
+    })
 }
 
 /// A global allocator that tracks allocations and deallocations on behalf of
@@ -1231,6 +1411,9 @@ unsafe impl GlobalAlloc for Alloc {
         if ignore_allocs.was_already_ignoring_allocs {
             System.alloc(layout)
         } else {
+            let early_bt = UNTRIMMED_HEAP
+                .load(Ordering::Relaxed)
+                .then(|| new_backtrace_inner(None, &FxHashMap::default()));
             let phase: &mut Phase<Globals> = &mut TRI_GLOBALS.lock();
             let ptr = System.alloc(layout);
             if ptr.is_null() {
@@ -1239,7 +1422,10 @@ unsafe impl GlobalAlloc for Alloc {
 
             if let Phase::Running(g @ Globals { heap: Some(_), .. }) = phase {
                 let size = layout.size();
-                let bt = new_backtrace!(g);
+                let bt = match early_bt {
+                    Some(bt) => bt,
+                    None => new_backtrace!(g),
+                };
                 let pp_info_idx = g.get_pp_info(bt, PpInfo::new_heap);
 
                 let now = Instant::now();
@@ -1348,6 +1534,7 @@ impl Profiler {
         let ignore_allocs = IgnoreAllocs::new();
         std::assert!(!ignore_allocs.was_already_ignoring_allocs);
 
+        UNTRIMMED_HEAP.store(false, Ordering::Relaxed);
         let phase: &mut Phase<Globals> = &mut TRI_GLOBALS.lock();
         match std::mem::replace(phase, Phase::Ready) {
             Phase::Ready => unreachable!(),
@@ -1378,62 +1565,27 @@ impl Drop for Profiler {
 // A wrapper for `backtrace::Backtrace` that implements `Eq` and `Hash`, which
 // only look at the frame IPs. This assumes that any two
 // `backtrace::Backtrace`s with the same frame IPs are equivalent.
-#[derive(Debug)]
-struct Backtrace(backtrace::Backtrace);
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct Backtrace(Box<[usize]>);
 
 impl Backtrace {
-    // The top frame symbols in a backtrace (those relating to backtracing
-    // itself) are typically the same, and look something like this (Mac or
-    // Linux release build, Dec 2021):
-    // - 0x10fca200a: backtrace::backtrace::libunwind::trace
-    // - 0x10fca200a: backtrace::backtrace::trace_unsynchronized
-    // - 0x10fca200a: backtrace::backtrace::trace
-    // - 0x10fc97350: dhat::new_backtrace_inner
-    // - 0x10fc97984: [interesting function]
-    //
-    // We compare the top frames of a stack obtained while profiling with those
-    // in `start_bt`. Those that overlap are the frames relating to backtracing
-    // that can be discarded.
-    //
-    // The bottom frame symbols in a backtrace (those below `main`) are
-    // typically the same, and look something like this (Mac or Linux release
-    // build, Dec 2021):
-    // - 0x1060f70e8: dhatter::main
-    // - 0x1060f7026: core::ops::function::FnOnce::call_once
-    // - 0x1060f7026: std::sys_common::backtrace::__rust_begin_short_backtrace
-    // - 0x1060f703c: std::rt::lang_start::{{closure}}
-    // - 0x10614b79a: core::ops::function::impls::<impl core::ops::function::FnOnce<A> for &F>::call_once
-    // - 0x10614b79a: std::panicking::try::do_call
-    // - 0x10614b79a: std::panicking::try
-    // - 0x10614b79a: std::panic::catch_unwind
-    // - 0x10614b79a: std::rt::lang_start_internal::{{closure}}
-    // - 0x10614b79a: std::panicking::try::do_call
-    // - 0x10614b79a: std::panicking::try
-    // - 0x10614b79a: std::panic::catch_unwind
-    // - 0x10614b79a: std::rt::lang_start_internal
-    // - 0x1060f7259: ???
-    //
-    // We compare the bottom frames of a stack obtained while profiling with
-    // those in `start_bt`. Those that overlap are the frames below main that
-    // can be discarded.
+    // Frames at the top (the backtracing itself) and at the bottom (below
+    // `main`) that every backtrace shares with `start_bt`.
     fn get_frames_to_trim(&self, start_bt: &Backtrace) -> FxHashMap<usize, TB> {
         let mut frames_to_trim = FxHashMap::default();
-        let frames1 = self.0.frames();
-        let frames2 = start_bt.0.frames();
+        let frames1 = &self.0;
+        let frames2 = &start_bt.0;
 
         let (mut i1, mut i2) = (0, 0);
         loop {
             if i1 == frames1.len() - 1 || i2 == frames2.len() - 1 {
-                // This should never happen in practice, it's too much
-                // similarity between the backtraces. If it does happen,
-                // abandon top trimming entirely.
                 frames_to_trim.retain(|_, v| *v == TB::Bottom);
                 break;
             }
-            if frames1[i1].ip() != frames2[i2].ip() {
+            if frames1[i1] != frames2[i2] {
                 break;
             }
-            frames_to_trim.insert(frames1[i1].ip() as usize, TB::Top);
+            frames_to_trim.insert(frames1[i1], TB::Top);
             i1 += 1;
             i2 += 1;
         }
@@ -1441,16 +1593,13 @@ impl Backtrace {
         let (mut i1, mut i2) = (frames1.len() - 1, frames2.len() - 1);
         loop {
             if i1 == 0 || i2 == 0 {
-                // This should never happen in practice, it's too much
-                // similarity between the backtraces. If it does happen,
-                // abandon bottom trimming entirely.
                 frames_to_trim.retain(|_, v| *v == TB::Top);
                 break;
             }
-            if frames1[i1].ip() != frames2[i2].ip() {
+            if frames1[i1] != frames2[i2] {
                 break;
             }
-            frames_to_trim.insert(frames1[i1].ip() as usize, TB::Bottom);
+            frames_to_trim.insert(frames1[i1], TB::Bottom);
             i1 -= 1;
             i2 -= 1;
         }
@@ -1458,133 +1607,19 @@ impl Backtrace {
         frames_to_trim
     }
 
-    // The top frame symbols in a trimmed heap profiling backtrace vary
-    // significantly, depending on build configuration, platform, and program
-    // point, and look something like this (Mac or Linux release build, Dec
-    // 2021):
-    // - 0x103ad464c: <dhat::Alloc as core::alloc::global::GlobalAlloc>::alloc
-    // - 0x103acac99: __rg_alloc                    // sometimes missing
-    // - 0x103acfe47: alloc::alloc::alloc           // sometimes missing
-    // - 0x103acfe47: alloc::alloc::Global::alloc_impl
-    // - 0x103acfe47: <alloc::alloc::Global as core::alloc::Allocator>::allocate
-    // - 0x103acfe47: alloc::alloc::exchange_malloc // sometimes missing
-    // - 0x103acfe47: [allocation point in program being profiled]
-    //
-    // We scan backwards for the first frame that looks like it comes from
-    // allocator code, and all frames before it. If we don't find any such
-    // frames, we show from frame 0, i.e. all frames.
-    //
-    // Note: this is a little dangerous. When deciding if a new backtrace has
-    // been seen before, we consider all the IP addresses within it. And then
-    // we trim some of those. It's possible that this will result in some
-    // previously distinct traces becoming the same, which makes dh_view.html
-    // abort. If that ever happens, look to see if something is going wrong
-    // here.
-    fn first_heap_symbol_to_show(&self) -> usize {
-        // Examples of symbols that this search will match:
-        // - alloc::alloc::{alloc,realloc,exchange_malloc}
-        // - <alloc::alloc::Global as core::alloc::Allocator>::{allocate,grow}
-        // - <dhat::Alloc as core::alloc::global::GlobalAlloc>::alloc
-        // - __rg_{alloc,realloc}
-        //
-        // Be careful when changing this, because to do it properly requires
-        // testing both debug and release builds on multiple platforms.
-        self.first_symbol_to_show(|s| {
-            s.starts_with("alloc::alloc::")
-                || s.starts_with("<alloc::alloc::")
-                || s.starts_with("<dhat::Alloc")
-                || s.starts_with("__rg_")
-        })
-    }
-
-    // The top frame symbols in a trimmed ad hoc profiling backtrace are always
-    // the same, something like this (Mac or Linux release build, Dec 2021):
-    // - 0x10cc1f504: dhat::ad_hoc_event
-    // - 0x10cc1954d: [dhat::ad_hoc_event call site in program being profiled]
-    //
-    // So need not trim frames, and can show from frame 0 onward.
-    fn first_ad_hoc_symbol_to_show(&self) -> usize {
-        0
-    }
-
-    // Find the first symbol to show, based on the predicate `p`.
-    fn first_symbol_to_show<P: Fn(&str) -> bool>(&self, p: P) -> usize {
-        // Get the symbols into a vector so we can reverse iterate over them.
-        let symbols: Vec<_> = self
-            .0
-            .frames()
-            .iter()
-            .flat_map(|f| f.symbols().iter())
-            .collect();
-
-        for (i, symbol) in symbols.iter().enumerate().rev() {
-            // Use `{:#}` to print the "alternate" form of the symbol name,
-            // which omits the trailing hash (e.g. `::ha68e4508a38cc95a`).
-            if let Some(s) = symbol.name().map(|name| format!("{:#}", name)) {
-                if p(&s) {
-                    return i;
-                }
+    // The first symbol after the allocator's own frames; see the heap case
+    // of `first_symbol_to_show` in upstream dhat.
+    fn first_heap_symbol_to_show(symbols: &[&(String, String)]) -> usize {
+        for (i, (name, _)) in symbols.iter().enumerate().rev() {
+            if name.starts_with("alloc::alloc::")
+                || name.starts_with("<alloc::alloc::")
+                || name.starts_with("<dhat::Alloc")
+                || name.starts_with("__rg_")
+            {
+                return i;
             }
         }
         0
-    }
-
-    // Useful for debugging.
-    #[allow(dead_code)]
-    fn eprint(&self) {
-        for frame in self.0.frames().iter() {
-            for symbol in frame.symbols().iter() {
-                eprintln!("{}", Backtrace::frame_to_string(frame, symbol));
-            }
-        }
-    }
-
-    fn frame_to_string(
-        frame: &backtrace::BacktraceFrame,
-        symbol: &backtrace::BacktraceSymbol,
-    ) -> String {
-        format!(
-            // Use `{:#}` to print the "alternate" form of the symbol name,
-            // which omits the trailing hash (e.g. `::ha68e4508a38cc95a`).
-            "{:?}: {:#} ({:#}:{}:{})",
-            frame.ip(),
-            symbol.name().unwrap_or_else(|| SymbolName::new(b"???")),
-            match symbol.filename() {
-                Some(path) => trim_path(path),
-                None => Path::new("???"),
-            }
-            .display(),
-            symbol.lineno().unwrap_or(0),
-            symbol.colno().unwrap_or(0),
-        )
-    }
-}
-
-impl PartialEq for Backtrace {
-    fn eq(&self, other: &Self) -> bool {
-        let mut frames1 = self.0.frames().iter();
-        let mut frames2 = other.0.frames().iter();
-        loop {
-            let ip1 = frames1.next().map(|f| f.ip());
-            let ip2 = frames2.next().map(|f| f.ip());
-            if ip1 != ip2 {
-                return false;
-            }
-            if ip1 == None {
-                return true;
-            }
-            // Otherwise, continue.
-        }
-    }
-}
-
-impl Eq for Backtrace {}
-
-impl Hash for Backtrace {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        for frame in self.0.frames().iter() {
-            frame.ip().hash(state);
-        }
     }
 }
 
@@ -1740,12 +1775,12 @@ where
 #[macro_export]
 macro_rules! assert {
     ($cond:expr) => ({
-        if $crate::check_assert_condition(|| $cond) {
+        if dhat::check_assert_condition(|| $cond) {
             panic!("dhat: assertion failed: {}", stringify!($cond));
         }
     });
     ($cond:expr, $($arg:tt)+) => ({
-        if $crate::check_assert_condition(|| $cond) {
+        if dhat::check_assert_condition(|| $cond) {
             panic!("dhat: assertion failed: {}: {}", stringify!($cond), format_args!($($arg)+));
         }
     });
@@ -1766,7 +1801,7 @@ macro_rules! assert {
 #[macro_export]
 macro_rules! assert_eq {
     ($left:expr, $right:expr $(,)?) => ({
-        if $crate::check_assert_condition( || $left == $right) {
+        if dhat::check_assert_condition( || $left == $right) {
             panic!(
                 "dhat: assertion failed: `(left == right)`\n  left: `{:?}`,\n right: `{:?}`",
                 $left, $right
@@ -1774,7 +1809,7 @@ macro_rules! assert_eq {
         }
     });
     ($left:expr, $right:expr, $($arg:tt)+) => ({
-        if $crate::check_assert_condition(|| $left == $right) {
+        if dhat::check_assert_condition(|| $left == $right) {
             panic!(
                 "dhat: assertion failed: `(left == right)`\n  left: `{:?}`,\n right: `{:?}`: {}",
                 $left, $right, format_args!($($arg)+)
@@ -1798,7 +1833,7 @@ macro_rules! assert_eq {
 #[macro_export]
 macro_rules! assert_ne {
     ($left:expr, $right:expr) => ({
-        if $crate::check_assert_condition(|| $left != $right) {
+        if dhat::check_assert_condition(|| $left != $right) {
             panic!(
                 "dhat: assertion failed: `(left != right)`\n  left: `{:?}`,\n right: `{:?}`",
                 $left, $right
@@ -1806,7 +1841,7 @@ macro_rules! assert_ne {
         }
     });
     ($left:expr, $right:expr, $($arg:tt)+) => ({
-        if $crate::check_assert_condition(|| $left != $right) {
+        if dhat::check_assert_condition(|| $left != $right) {
             panic!(
                 "dhat: assertion failed: `(left != right)`\n  left: `{:?}`,\n right: `{:?}`: {}",
                 $left, $right, format_args!($($arg)+)
@@ -1976,8 +2011,74 @@ pub fn assert_is_panic<R, F: FnOnce() -> R + std::panic::UnwindSafe>(f: F, expec
 
 #[cfg(test)]
 mod test {
-    use super::trim_path;
+    use super::{new_backtrace_inner, trim_path, Backtrace, FxHashMap};
     use std::path::Path;
+
+    // Opens `depth` calls, then takes a backtrace. The call that opens each
+    // one is not its last act, so none is a tail call.
+    #[inline(never)]
+    fn descend(depth: usize, taken: &mut Option<Backtrace>) {
+        if depth == 0 {
+            *taken = Some(new_backtrace_inner(None, &FxHashMap::default()));
+        } else {
+            descend(depth - 1, taken);
+            std::hint::black_box(depth);
+        }
+    }
+
+    // The same `depth` calls are open from the one call site that opens them,
+    // so a backtrace holds its return address `depth` times.
+    fn assert_sees_each_open_call(depth: usize) {
+        let mut taken = None;
+        descend(depth, &mut taken);
+        let frames = taken.expect("a backtrace was taken").0;
+        let mut seen: FxHashMap<usize, usize> = FxHashMap::default();
+        for &ip in frames.iter() {
+            *seen.entry(ip).or_default() += 1;
+        }
+        let most = seen.values().copied().max().unwrap_or(0);
+        std::assert_eq!(
+            most,
+            depth,
+            "{} frames, the most repeated address {} times",
+            frames.len(),
+            most
+        );
+    }
+
+    #[test]
+    fn a_backtrace_has_a_frame_for_each_open_call() {
+        assert_sees_each_open_call(40);
+    }
+
+    #[test]
+    fn a_backtrace_on_a_thread_of_its_own_has_a_frame_for_each_open_call() {
+        std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(|| assert_sees_each_open_call(40))
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(dhat_frame_pointers)]
+    #[test]
+    fn a_threads_stack_holds_the_addresses_of_its_locals() {
+        let here = 0u8;
+        let at = &here as *const u8 as usize;
+        let (lo, hi) = super::stack_bounds();
+        std::assert!(lo <= at && at < hi, "{lo:#x} <= {at:#x} < {hi:#x}");
+        std::assert!(hi - lo < 1 << 40, "{lo:#x}..{hi:#x} is not a stack");
+        let spawned = std::thread::spawn(|| {
+            let here = 0u8;
+            let at = &here as *const u8 as usize;
+            (super::stack_bounds(), at)
+        })
+        .join()
+        .unwrap();
+        let ((lo, hi), at) = spawned;
+        std::assert!(lo <= at && at < hi, "{lo:#x} <= {at:#x} < {hi:#x}");
+    }
 
     #[test]
     fn test_trim_path() {
